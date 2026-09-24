@@ -36,3 +36,8 @@ htmlcov/
 .vscode/
 .DS_Store
 Thumbs.db
+
+# Environment files containing secrets
+.env
+.env.*
+!.env.example
