@@ -8,6 +8,8 @@ import pytest
 import pytest_asyncio
 from fastapi import status
 
+import app.inference_client as inference_client
+from app.inference_client import PermanentInferenceError, RetryableInferenceError
 import app.main as main
 
 
@@ -33,6 +35,7 @@ async def client() -> AsyncIterator[httpx.AsyncClient]:
 async def reset_job_state() -> AsyncIterator[None]:
     main.jobs.clear()
     main.results.clear()
+
     yield
 
     for _ in range(200):
@@ -44,6 +47,14 @@ async def reset_job_state() -> AsyncIterator[None]:
 
     main.jobs.clear()
     main.results.clear()
+
+
+@pytest.fixture(autouse=True)
+def mock_inference(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def fake_inference(prompt: str) -> str:
+        return f"mock response for: {prompt}"
+
+    monkeypatch.setattr(main, "run_inference", fake_inference)
 
 
 async def wait_for_terminal(client: httpx.AsyncClient, job_id: str) -> dict:
@@ -60,6 +71,125 @@ async def submit_sample(client: httpx.AsyncClient) -> dict:
     response = await client.post("/jobs", json={"file_path": SAMPLE_BATCH_PATH})
     assert response.status_code == status.HTTP_201_CREATED
     return response.json()
+
+
+async def test_inference_client_sends_official_request(monkeypatch: pytest.MonkeyPatch) -> None:
+    request = {}
+
+    class MockAsyncClient:
+        def __init__(self, *, timeout: float) -> None:
+            assert timeout == inference_client.REQUEST_TIMEOUT_SECONDS
+
+        async def __aenter__(self) -> "MockAsyncClient":
+            return self
+
+        async def __aexit__(self, *args: object) -> None:
+            return None
+
+        async def post(self, endpoint: str, *, headers: dict, json: dict) -> httpx.Response:
+            request.update(endpoint=endpoint, headers=headers, json=json)
+            return httpx.Response(
+                status_code=200,
+                json={"choices": [{"message": {"content": "generated text"}}]},
+            )
+
+    monkeypatch.setenv("MODEL_ACCESS_KEY", "test-model-access-key")
+    monkeypatch.setenv("INFERENCE_ENDPOINT", "https://example.test/inference")
+    monkeypatch.setattr(inference_client.httpx, "AsyncClient", MockAsyncClient)
+
+    result = await inference_client.run_inference("Summarize this")
+
+    assert result == "generated text"
+    assert request == {
+        "endpoint": "https://example.test/inference",
+        "headers": {
+            "Authorization": "Bearer test-model-access-key",
+            "Content-Type": "application/json",
+        },
+        "json": {
+            "model": "openai-gpt-oss-20b",
+            "messages": [{"role": "user", "content": "Summarize this"}],
+            "max_completion_tokens": 300,
+            "reasoning_effort": "low",
+        },
+    }
+
+
+@pytest.mark.parametrize("missing", ["MODEL_ACCESS_KEY", "INFERENCE_ENDPOINT"])
+async def test_inference_client_rejects_missing_configuration(
+    monkeypatch: pytest.MonkeyPatch,
+    missing: str,
+) -> None:
+    monkeypatch.setenv("MODEL_ACCESS_KEY", "test-model-access-key")
+    monkeypatch.setenv("INFERENCE_ENDPOINT", "https://example.test/inference")
+    monkeypatch.delenv(missing)
+
+    with pytest.raises(PermanentInferenceError, match="is not configured"):
+        await inference_client.run_inference("prompt")
+
+
+@pytest.mark.parametrize("status_code", [403, 429, 500, 503])
+async def test_inference_client_classifies_retryable_statuses(
+    monkeypatch: pytest.MonkeyPatch,
+    status_code: int,
+) -> None:
+    class MockAsyncClient:
+        def __init__(self, *, timeout: float) -> None:
+            pass
+
+        async def __aenter__(self) -> "MockAsyncClient":
+            return self
+
+        async def __aexit__(self, *args: object) -> None:
+            return None
+
+        async def post(self, *args: object, **kwargs: object) -> httpx.Response:
+            return httpx.Response(
+                status_code=status_code,
+                json={"error": {"message": "provider message"}},
+            )
+
+    monkeypatch.setenv("MODEL_ACCESS_KEY", "test-model-access-key")
+    monkeypatch.setenv("INFERENCE_ENDPOINT", "https://example.test/inference")
+    monkeypatch.setattr(inference_client.httpx, "AsyncClient", MockAsyncClient)
+
+    with pytest.raises(
+        RetryableInferenceError,
+        match=rf"{status_code}.*provider message",
+    ):
+        await inference_client.run_inference("prompt")
+
+
+@pytest.mark.parametrize("status_code", [400, 401])
+async def test_inference_client_classifies_permanent_statuses(
+    monkeypatch: pytest.MonkeyPatch,
+    status_code: int,
+) -> None:
+    class MockAsyncClient:
+        def __init__(self, *, timeout: float) -> None:
+            pass
+
+        async def __aenter__(self) -> "MockAsyncClient":
+            return self
+
+        async def __aexit__(self, *args: object) -> None:
+            return None
+
+        async def post(self, *args: object, **kwargs: object) -> httpx.Response:
+            return httpx.Response(
+                status_code=status_code,
+                json={"error": {"message": "provider message"}},
+            )
+
+    monkeypatch.setenv("MODEL_ACCESS_KEY", "test-model-access-key")
+    monkeypatch.setenv("INFERENCE_ENDPOINT", "https://example.test/inference")
+    monkeypatch.setattr(inference_client.httpx, "AsyncClient", MockAsyncClient)
+
+    with pytest.raises(
+        PermanentInferenceError,
+        match=rf"{status_code}.*provider message",
+    ):
+        await inference_client.run_inference("prompt")
 
 
 async def test_health_endpoint(client: httpx.AsyncClient) -> None:
@@ -213,7 +343,7 @@ async def test_transient_failure_is_retried(
         if prompt == PROMPTS[0]:
             attempts += 1
             if attempts < 2:
-                raise RuntimeError("temporary failure")
+                raise RetryableInferenceError("temporary failure")
         return await original(prompt)
 
     monkeypatch.setattr(main, "run_inference", transient_inference)
@@ -233,7 +363,7 @@ async def test_partial_failure_isolated_and_ordered(
 
     async def partial_failure(prompt: str) -> str:
         if prompt == PROMPTS[1]:
-            raise RuntimeError("permanent prompt failure")
+            raise PermanentInferenceError("permanent prompt failure")
         return await original(prompt)
 
     monkeypatch.setattr(main, "run_inference", partial_failure)
@@ -257,7 +387,7 @@ async def test_complete_failure_sets_failed_status(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     async def permanent_failure(prompt: str) -> str:
-        raise RuntimeError("permanent failure")
+        raise PermanentInferenceError("permanent failure")
 
     monkeypatch.setattr(main, "run_inference", permanent_failure)
     payload = await submit_sample(client)
@@ -302,7 +432,7 @@ async def test_download_allows_completed_with_errors(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     async def permanent_failure(prompt: str) -> str:
-        raise RuntimeError("permanent failure")
+        raise PermanentInferenceError("permanent failure")
 
     monkeypatch.setattr(main, "run_inference", permanent_failure)
     payload = await submit_sample(client)

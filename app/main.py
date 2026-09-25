@@ -9,7 +9,7 @@ from fastapi import FastAPI, HTTPException, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from .inference_client import run_inference
+from .inference_client import RetryableInferenceError, run_inference
 
 
 class JobSubmissionRequest(BaseModel):
@@ -51,7 +51,7 @@ async def run_inference_with_retries(prompt: str) -> str:
         try:
             async with processing_semaphore:
                 return await run_inference(prompt)
-        except Exception:
+        except RetryableInferenceError:
             if attempt == MAX_RETRIES:
                 raise
             delay = BASE_BACKOFF_SECONDS * (2**attempt)
